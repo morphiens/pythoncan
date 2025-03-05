@@ -27,7 +27,7 @@ from typing_extensions import Self
 import can
 import can.typechecking
 from can.broadcastmanager import CyclicSendTaskABC, ThreadBasedCyclicSendTask
-from can.message import Message
+from canserver.pythoncan.can.message import Message
 
 LOG = logging.getLogger("can_comm_logger")
 
