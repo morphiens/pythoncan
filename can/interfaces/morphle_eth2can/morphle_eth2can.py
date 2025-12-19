@@ -99,14 +99,15 @@ class MorphleCanBus(can.BusABC):
                 return None, False
 
             msg = self.__socket.recv(1024)  # may contain multiple messages
-            log.debug("received message-len={}, message={}".format(len(msg), msg))
+            log.debug("received raw can message (over ethernet, may contain multiple can messages). len={}, message={}".format(len(msg), msg))
             self.__receive_buffer += msg
 
-            for i in range(int(len(self.__receive_buffer) / self.__ethcan_message_fixed_len)):
+            num_messages = int(len(self.__receive_buffer) / self.__ethcan_message_fixed_len)
+            for i in range(num_messages):
                 can_frame = self.__receive_buffer[
                             i * self.__ethcan_message_fixed_len:(i + 1) * self.__ethcan_message_fixed_len]
                 if self.__receive_buffer[i * self.__ethcan_message_fixed_len] <= self.__ethcan_message_head:
-                    log.debug("[{}] full eth2can message: {}".format(i, can_frame))
+                    log.debug("[{}/{}] received full eth2can message: {}".format(i, num_messages, can_frame))
                     self.__message_buffer.append(can.Message(
                         arbitration_id=struct.unpack(self.__COMMAND_STRUCT_HEADER, bytes(can_frame[:5]))[1],
                         data=can_frame[5:],
@@ -114,11 +115,11 @@ class MorphleCanBus(can.BusABC):
                         timestamp=0.0,
                     ))
                 else:
-                    log.error("[{}] invalid eth2can message, Please check the eth2can configuration. "
-                          " Contact the Author more details: {}".format(i, can_frame))
+                    log.error("[{}/{}] invalid eth2can message, Please check the eth2can configuration. "
+                          " Contact the Author more details: {}".format(i, num_messages, can_frame))
 
             self.__receive_buffer = self.__receive_buffer[
-                                    int(len(self.__receive_buffer) / self.__ethcan_message_fixed_len) *
+                                    num_messages *
                                     self.__ethcan_message_fixed_len:]
 
             can_message = (
@@ -126,7 +127,7 @@ class MorphleCanBus(can.BusABC):
                 if len(self.__message_buffer) == 0
                 else self.__message_buffer.popleft()
             )
-            log.debug("received can message: " + str(can_message))
+            log.debug("returning can message: " + str(can_message))
             return can_message, False
 
         except Exception as exc:
