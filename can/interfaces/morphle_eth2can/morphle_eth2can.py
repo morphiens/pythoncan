@@ -112,7 +112,7 @@ class MorphleCanBus(can.BusABC):
                         arbitration_id=struct.unpack(self.__COMMAND_STRUCT_HEADER, bytes(can_frame[:5]))[1],
                         data=can_frame[5:],
                         is_extended_id=False,
-                        timestamp=0.0,
+                        timestamp=time.time(),
                     ))
                 else:
                     log.error("[{}/{}] invalid eth2can message, Please check the eth2can configuration. "
