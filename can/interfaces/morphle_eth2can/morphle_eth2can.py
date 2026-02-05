@@ -113,7 +113,7 @@ class MorphleCanBus(can.BusABC):
         self.channel_info = f"morphle_eth2can connecting on {host}:{port}"
         connect_to_server(self.__socket, self.__host, self.__port)
 
-        log.error(
+        log.info(
             f"morphle_eth2can: started socket server at address {self.__socket.getsockname()}"
         )
 
@@ -155,8 +155,12 @@ class MorphleCanBus(can.BusABC):
                     # Configure keepalive on new socket
                     configure_tcp_keepalive(self.__socket)
                     
-                    # Clear buffers
+                    # Clear ALL buffers to avoid stale message issues
+                    # - __receive_buffer: raw bytes that haven't been parsed yet
+                    # - __message_buffer: parsed CAN messages waiting to be returned
+                    # Both must be cleared to prevent stale data from causing protocol errors
                     self.__receive_buffer = []
+                    self.__message_buffer.clear()
                     
                     log.info(f"[eth2can] ✅ Successfully reconnected to {self.__host}:{self.__port} on attempt {attempt}/{self.MAX_RECONNECT_ATTEMPTS}")
                     self.__connection_healthy = True
@@ -297,7 +301,12 @@ class MorphleCanBus(can.BusABC):
         """Send a TCP message with automatic reconnection on failure.
         
         :param msg: The message bytes to send.
-        :param retry_on_error: If True, attempt reconnection and retry on connection errors.
+        :param retry_on_error: If True, attempt reconnection on connection errors.
+        
+        NOTE: We do NOT retry the send after reconnection because:
+        1. The message may have already been transmitted before the error was detected
+        2. Retrying could cause duplicate commands to be sent to motors
+        3. The higher-level protocol (node.py) already has retry logic with counters
         """
         log.debug(f"Sending TCP Message: '{msg}'")
         try:
@@ -307,11 +316,14 @@ class MorphleCanBus(can.BusABC):
             if retry_on_error:
                 # Generate diagnostic at time of error (before reconnect attempt)
                 self._generate_failure_diagnostic(f"Send failed: {type(e).__name__}")
+                # Attempt reconnection to restore connection for future sends
+                # but do NOT retry this specific send - it may have already gone through
+                # and retrying would cause duplicate messages (stale message repush)
                 if self._reconnect():
-                    log.info("[eth2can] Reconnected successfully, retrying send...")
-                    # Retry send after reconnection (without retry to avoid infinite loop)
-                    self._tcp_send(msg, retry_on_error=False)
-                    return
+                    log.warning("[eth2can] Reconnected successfully after send error. "
+                               "NOT retrying send to avoid duplicate messages - let higher layer retry.")
+                    # Re-raise the exception so higher layer can decide whether to retry
+                    # with proper counter management
             raise
 
     def send(self, msg, timeout=None):
