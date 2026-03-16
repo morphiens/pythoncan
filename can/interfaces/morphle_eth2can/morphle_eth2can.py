@@ -5,6 +5,7 @@ https://www.uotek.com/pro_view-236.html__name__
 https://www.uotek.com/Uploads/file/20230210/20230210143551_12219.pdf
 """
 import datetime
+import errno
 import logging
 import select
 import socket
@@ -491,6 +492,11 @@ class MorphleCanBus(can.BusABC):
                     log.warning("[eth2can] _check_socket_health: recv peek returned empty (connection closed)")
                     return False
         except (OSError, socket.error) as e:
+            if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                # EAGAIN/EWOULDBLOCK from MSG_DONTWAIT recv means no data available right now —
+                # not a dead socket. The select() indicated readable but the data was already
+                # consumed (e.g. by the notifier thread) between select and recv. Socket is healthy.
+                return True
             log.warning(f"[eth2can] _check_socket_health: socket error during health check: {e}")
             return False
         return True
