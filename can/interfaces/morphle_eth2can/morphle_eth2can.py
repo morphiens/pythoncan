@@ -153,6 +153,7 @@ class MorphleCanBus(can.BusABC):
         self._socket_path = socket_path_kw or os.environ.get(
             "CAN_SERVICE_SOCKET", DEFAULT_CAN_SERVICE_SOCKET
         )
+        self._on_transport_reconnect = kwargs.pop("on_transport_reconnect", None)
 
         self.__reconnect_lock = threading.Lock()
         self.__is_reconnecting = False
@@ -194,6 +195,14 @@ class MorphleCanBus(can.BusABC):
             )
 
         super().__init__(channel=None, can_filters=can_filters, **kwargs)
+
+    def _invoke_transport_reconnect_hook(self) -> None:
+        hook = getattr(self, "_on_transport_reconnect", None)
+        if callable(hook):
+            try:
+                hook()
+            except Exception as exc:
+                log.warning("[eth2can] on_transport_reconnect hook failed: %s", exc)
 
     def _mark_fault_detected(self):
         """Stamp the monotonic time of the first fault detection (idempotent)."""
@@ -266,6 +275,7 @@ class MorphleCanBus(can.BusABC):
                             self.MAX_RECONNECT_ATTEMPTS,
                         )
                         self.__connection_healthy = True
+                        self._invoke_transport_reconnect_hook()
                         return True
                     except (socket.error, OSError, TimeoutError) as e:
                         log.warning(
@@ -326,6 +336,7 @@ class MorphleCanBus(can.BusABC):
                         downtime_sec=downtime_sec,
                     )
                     self.__fault_detected_at = 0.0
+                    self._invoke_transport_reconnect_hook()
                     return True
 
                 except (socket.error, OSError, ConnectionRefusedError, ConnectionResetError) as e:
