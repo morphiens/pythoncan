@@ -7,6 +7,7 @@ https://www.uotek.com/Uploads/file/20230210/20230210143551_12219.pdf
 import datetime
 import errno
 import logging
+import os
 import select
 import socket
 import struct
@@ -14,8 +15,14 @@ import time
 import traceback
 import threading
 from collections import deque
+from typing import Set
 
 import can
+
+try:
+    from src.can_service import protocol as can_daemon_protocol
+except ImportError:
+    can_daemon_protocol = None
 
 # Optional diagnostic import - gracefully degrade if not available
 try:
@@ -69,6 +76,40 @@ def connect_to_server(s, host, port):
     )
 
 
+def connect_unix_with_retry(path: str) -> socket.socket:
+    """Connect to a Unix domain socket with the same retry window as TCP eth2can."""
+    timeout_ms = 10000
+    now = time.time() * 1000
+    end_time = now + timeout_ms
+    last_exc = None
+    while now < end_time:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.connect(path)
+            return s
+        except OSError as e:
+            last_exc = e
+            try:
+                s.close()
+            except Exception:
+                pass
+            log.warning(f"Failed to connect Unix CAN daemon socket {path}: {e}")
+            time.sleep(0.2)
+            now = time.time() * 1000
+    raise TimeoutError(
+        f"connect_unix_with_retry: Failed to connect {path} for {timeout_ms} ms: {last_exc}"
+    )
+
+
+def _use_separate_can_from_env() -> bool:
+    """True when morphle.profile (or env) sets USE_SEPARATE_CAN_SERVICE."""
+    v = os.environ.get("USE_SEPARATE_CAN_SERVICE", "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+DEFAULT_CAN_SERVICE_SOCKET = "/run/robotome-can/can.sock"
+
+
 class MorphleCanBus(can.BusABC):
     # Maximum reconnection attempts before giving up
     MAX_RECONNECT_ATTEMPTS = 5
@@ -101,77 +142,171 @@ class MorphleCanBus(can.BusABC):
         self.__ethcan_message_fixed_len = 13
         self.__ethcan_message_head = 0x08
 
-        self.__host = host
-        self.__port = port
-        
-        # Reconnection state
+        use_separate = kwargs.pop("use_separate_can_service", None)
+        if use_separate is None:
+            use_separate = _use_separate_can_from_env()
+        else:
+            use_separate = bool(use_separate)
+
+        self._proxy_bus_id = int(kwargs.pop("proxy_bus_id", 1))
+        socket_path_kw = kwargs.pop("can_service_socket", None)
+        self._socket_path = socket_path_kw or os.environ.get(
+            "CAN_SERVICE_SOCKET", DEFAULT_CAN_SERVICE_SOCKET
+        )
+
         self.__reconnect_lock = threading.Lock()
         self.__is_reconnecting = False
         self.__connection_healthy = True
-        self.__last_failure_type = "unknown"  # set before each _reconnect() call
+        self.__last_failure_type = "unknown"  # set before each _reconnect() call (TCP path)
         self.__fault_detected_at: float = 0.0  # monotonic timestamp of first fault detection
 
-        self.__socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.__message_buffer = deque()
         self.__receive_buffer = []
-        self.channel_info = f"morphle_eth2can connecting on {host}:{port}"
-        connect_to_server(self.__socket, self.__host, self.__port)
 
-        log.info(
-            f"morphle_eth2can: started socket server at address {self.__socket.getsockname()}"
-        )
+        if use_separate:
+            if can_daemon_protocol is None:
+                raise ImportError(
+                    "use_separate_can_service requires src.can_service.protocol (repo root on PYTHONPATH)."
+                )
+            self._proxy_mode = True
+            self._proxy_protocol = can_daemon_protocol
+            self._proxy_subscribed_ids: Set[int] = set()
+            self.__host = host
+            self.__port = int(port)
+            self.__socket = connect_unix_with_retry(self._socket_path)
+            self.channel_info = (
+                f"morphle_eth2can via robotome-can daemon unix:{self._socket_path} bus={self._proxy_bus_id}"
+            )
+            log.info(
+                "morphle_eth2can: connected to CAN daemon at %s (bus_id=%d)",
+                self._socket_path,
+                self._proxy_bus_id,
+            )
+        else:
+            self._proxy_mode = False
+            self.__host = host
+            self.__port = int(port)
+            self.__socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.channel_info = f"morphle_eth2can connecting on {host}:{port}"
+            connect_to_server(self.__socket, self.__host, self.__port)
+            log.info(
+                f"morphle_eth2can: started socket server at address {self.__socket.getsockname()}"
+            )
 
         super().__init__(channel=None, can_filters=can_filters, **kwargs)
-    
+
     def _mark_fault_detected(self):
         """Stamp the monotonic time of the first fault detection (idempotent)."""
         if self.__fault_detected_at == 0.0:
             self.__fault_detected_at = time.monotonic()
 
+    def notify_subscription(self, can_id: int, add: bool) -> None:
+        """When using robotome-can daemon, forward SUBSCRIBE/UNSUBSCRIBE (see CANHandler.subscribe)."""
+        if not self._proxy_mode:
+            return
+        if add:
+            self._proxy_subscribed_ids.add(can_id)
+            self._socket_send(
+                self._proxy_protocol.encode_subscribe(self._proxy_bus_id, can_id),
+                retry_on_error=True,
+            )
+        else:
+            self._proxy_subscribed_ids.discard(can_id)
+            self._socket_send(
+                self._proxy_protocol.encode_unsubscribe(self._proxy_bus_id, can_id),
+                retry_on_error=True,
+            )
+
+    def get_bus_state(self):
+        """Subset used by CANHandler.get_bus_state / BaseController diagnostics."""
+        return {
+            "channel_info": self.channel_info,
+            "bus_ready": self.__connection_healthy,
+            "bus_alive": self.__connection_healthy,
+            "msg_tx_count": None,
+            "msg_rx_count": None,
+        }
+
     def _reconnect(self):
-        """Attempt to reconnect the TCP socket with exponential backoff.
-        
-        Returns True if reconnection was successful, False otherwise.
-        Thread-safe: only one reconnection attempt at a time.
-        """
+        """Reconnect TCP to eth2can hardware, or Unix socket to robotome-can daemon."""
         with self.__reconnect_lock:
             if self.__is_reconnecting:
                 log.debug("[eth2can] Reconnection already in progress, waiting...")
                 return self.__connection_healthy
             self.__is_reconnecting = True
-        
+
         reconnect_start = time.monotonic()
         try:
+            if self._proxy_mode:
+                log.warning(
+                    "[eth2can] 🔄 Attempting to reconnect CAN daemon socket %s...",
+                    self._socket_path,
+                )
+                for attempt in range(1, self.MAX_RECONNECT_ATTEMPTS + 1):
+                    delay = min(self.RECONNECT_DELAY_BASE * (2 ** (attempt - 1)), 10.0)
+                    try:
+                        try:
+                            self.__socket.close()
+                        except Exception:
+                            pass
+                        self.__socket = connect_unix_with_retry(self._socket_path)
+                        self.__receive_buffer = []
+                        self.__message_buffer.clear()
+                        for cid in sorted(self._proxy_subscribed_ids):
+                            try:
+                                self.__socket.sendall(
+                                    self._proxy_protocol.encode_subscribe(self._proxy_bus_id, cid)
+                                )
+                            except Exception as exc:
+                                log.warning("[eth2can] resubscribe can_id=0x%X failed: %s", cid, exc)
+                        log.info(
+                            "[eth2can] ✅ Reconnected to CAN daemon %s (attempt %d/%d)",
+                            self._socket_path,
+                            attempt,
+                            self.MAX_RECONNECT_ATTEMPTS,
+                        )
+                        self.__connection_healthy = True
+                        return True
+                    except (socket.error, OSError, TimeoutError) as e:
+                        log.warning(
+                            "[eth2can] Daemon reconnection attempt %d/%d failed: %s",
+                            attempt,
+                            self.MAX_RECONNECT_ATTEMPTS,
+                            e,
+                        )
+                        if attempt < self.MAX_RECONNECT_ATTEMPTS:
+                            time.sleep(delay)
+                log.error("[eth2can] ❌ Failed to reconnect CAN daemon socket.")
+                self.__connection_healthy = False
+                return False
+
             log.warning(f"[eth2can] 🔄 Attempting to reconnect to {self.__host}:{self.__port}...")
-            
+
             for attempt in range(1, self.MAX_RECONNECT_ATTEMPTS + 1):
                 delay = min(self.RECONNECT_DELAY_BASE * (2 ** (attempt - 1)), 10.0)  # Max 10s delay
-                
+
                 try:
                     # Close old socket
                     try:
                         self.__socket.close()
                     except Exception:
                         pass
-                    
+
                     # Create new socket
                     self.__socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     self.__socket.settimeout(5.0)  # 5 second timeout for connect
-                    
+
                     # Attempt connection
                     self.__socket.connect((self.__host, self.__port))
                     self.__socket.settimeout(None)  # Reset to blocking mode
-                    
+
                     # Configure keepalive on new socket
                     configure_tcp_keepalive(self.__socket)
-                    
+
                     # Clear ALL buffers to avoid stale message issues
-                    # - __receive_buffer: raw bytes that haven't been parsed yet
-                    # - __message_buffer: parsed CAN messages waiting to be returned
-                    # Both must be cleared to prevent stale data from causing protocol errors
                     self.__receive_buffer = []
                     self.__message_buffer.clear()
-                    
+
                     reconnect_sec = time.monotonic() - reconnect_start
                     downtime_sec = (
                         (time.monotonic() - self.__fault_detected_at)
@@ -192,13 +327,13 @@ class MorphleCanBus(can.BusABC):
                     )
                     self.__fault_detected_at = 0.0
                     return True
-                    
+
                 except (socket.error, OSError, ConnectionRefusedError, ConnectionResetError) as e:
                     log.warning(f"[eth2can] Reconnection attempt {attempt}/{self.MAX_RECONNECT_ATTEMPTS} failed: {e}")
                     if attempt < self.MAX_RECONNECT_ATTEMPTS:
                         log.info(f"[eth2can] Retrying in {delay:.1f}s...")
                         time.sleep(delay)
-            
+
             reconnect_sec = time.monotonic() - reconnect_start
             downtime_sec = (
                 (time.monotonic() - self.__fault_detected_at)
@@ -209,14 +344,15 @@ class MorphleCanBus(can.BusABC):
                 f"| {reconnect_sec:.1f}s spent trying | down for {downtime_sec:.1f}s. Connection is dead."
             )
             self.__connection_healthy = False
-            self._log_uotek_device_failure(
-                error_type=self.__last_failure_type,
-                detail=f"reconnect exhausted all {self.MAX_RECONNECT_ATTEMPTS} attempts — connection dead",
-                recovered=False,
-                downtime_sec=downtime_sec,
-            )
+            if not self._proxy_mode:
+                self._log_uotek_device_failure(
+                    error_type=self.__last_failure_type,
+                    detail=f"reconnect exhausted all {self.MAX_RECONNECT_ATTEMPTS} attempts — connection dead",
+                    recovered=False,
+                    downtime_sec=downtime_sec,
+                )
             return False
-            
+
         finally:
             with self.__reconnect_lock:
                 self.__is_reconnecting = False
@@ -343,37 +479,98 @@ class MorphleCanBus(can.BusABC):
         """Generate a network diagnostic report when connection fails."""
         if DIAGNOSTICS_AVAILABLE and log_diagnostic_report:
             try:
-                log_diagnostic_report(
-                    trigger_reason=f"eth2can: {reason}",
-                    trigger_device=f"eth2can @ {self.__host}:{self.__port}",
-                    check_ports=True,
-                    device_ports={self.__host: self.__port},
-                    logger=log
-                )
+                if self._proxy_mode:
+                    log_diagnostic_report(
+                        trigger_reason=f"eth2can daemon: {reason}",
+                        trigger_device=f"unix:{self._socket_path}",
+                        check_ports=False,
+                        device_ports={},
+                        logger=log,
+                    )
+                else:
+                    log_diagnostic_report(
+                        trigger_reason=f"eth2can: {reason}",
+                        trigger_device=f"eth2can @ {self.__host}:{self.__port}",
+                        check_ports=True,
+                        device_ports={self.__host: self.__port},
+                        logger=log,
+                    )
             except Exception as e:
                 log.warning(f"[eth2can] Failed to generate diagnostic report: {e}")
         else:
-            # Basic diagnostic without the full module
             log.error(f"[eth2can] 📊 Basic connection diagnostic:")
-            log.error(f"   Target: {self.__host}:{self.__port}")
+            if self._proxy_mode:
+                log.error(f"   Target: unix:{self._socket_path}")
+            else:
+                log.error(f"   Target: {self.__host}:{self.__port}")
             log.error(f"   Connection healthy: {self.__connection_healthy}")
             log.error(f"   Reconnecting: {self.__is_reconnecting}")
-            # Try a simple ping
-            try:
-                import subprocess
-                result = subprocess.run(
-                    ['ping', '-c', '1', '-W', '2', self.__host],
-                    capture_output=True, text=True, timeout=3
-                )
-                ping_ok = result.returncode == 0
-                log.error(f"   Ping to {self.__host}: {'✓ OK' if ping_ok else '✗ FAILED'}")
-            except Exception as e:
-                log.error(f"   Ping check failed: {e}")
+            if not self._proxy_mode:
+                try:
+                    import subprocess
+                    result = subprocess.run(
+                        ['ping', '-c', '1', '-W', '2', self.__host],
+                        capture_output=True, text=True, timeout=3
+                    )
+                    ping_ok = result.returncode == 0
+                    log.error(f"   Ping to {self.__host}: {'✓ OK' if ping_ok else '✗ FAILED'}")
+                except Exception as e:
+                    log.error(f"   Ping check failed: {e}")
+
+    def _recv_internal_proxy(self, timeout):
+        """Receive one FRAME from robotome-can daemon (Unix socket protocol)."""
+        try:
+            ready_receive_sockets, _, _ = select.select(
+                [self.__socket], [], [], timeout
+            )
+        except OSError as exc:
+            log.error(f"[eth2can] select() failed (daemon): {exc}")
+            self._generate_failure_diagnostic(f"select() failed: {type(exc).__name__}: {exc}")
+            if self._reconnect():
+                log.info("[eth2can] Reconnected after select() error (daemon)")
+                return None, False
+            raise can.CanError(f"Failed to receive: {exc}")
+
+        if not ready_receive_sockets:
+            return None, False
+
+        try:
+            msg = self._proxy_protocol.read_message(self.__socket)
+        except ValueError as exc:
+            log.error(f"[eth2can] Invalid daemon frame: {exc}")
+            return None, False
+        except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError, OSError) as exc:
+            log.error(f"[eth2can] Connection error in recv (daemon): {exc}")
+            self._generate_failure_diagnostic(f"Connection error: {type(exc).__name__}")
+            if self._reconnect():
+                log.info("[eth2can] Reconnected successfully after connection error in recv (daemon)")
+                return None, False
+            raise can.CanError(f"Failed to receive and reconnection failed: {exc}")
+
+        if msg[0] != self._proxy_protocol.FRAME:
+            log.debug("[eth2can] daemon message type %s (not FRAME), ignoring", msg[0])
+            return None, False
+
+        _, bus_id, can_id, ts, data = msg
+        if bus_id != self._proxy_bus_id:
+            return None, False
+        return (
+            can.Message(
+                arbitration_id=can_id,
+                data=data,
+                is_extended_id=False,
+                timestamp=ts,
+            ),
+            False,
+        )
 
     def _recv_internal(self, timeout):
         if len(self.__message_buffer) != 0:
             can_message = self.__message_buffer.popleft()
             return can_message, False
+
+        if self._proxy_mode:
+            return self._recv_internal_proxy(timeout)
 
         try:
             # get all sockets that are ready (can be a list with a single value
@@ -501,56 +698,52 @@ class MorphleCanBus(can.BusABC):
             return False
         return True
 
-    def _tcp_send(self, msg, retry_on_error=True):
-        """Send a TCP message with automatic reconnection on failure.
+    def _socket_send(self, msg, retry_on_error=True):
+        """Send raw bytes (TCP eth2can or daemon IPC). TCP path uses proactive health check."""
+        log.debug("Sending socket message (len=%d)", len(msg))
 
-        Proactively checks socket health before sending so that a dead TCP
-        connection (e.g. UOTEK device reset) is detected immediately rather than
-        waiting for the 2 s read_ack timeout to expire.
-
-        :param msg: The message bytes to send.
-        :param retry_on_error: If True, attempt reconnection on connection errors.
-
-        NOTE: We do NOT retry the send after reconnection because:
-        1. The message may have already been transmitted before the error was detected
-        2. Retrying could cause duplicate commands to be sent to motors
-        3. The higher-level protocol (node.py) already has retry logic with counters
-        """
-        log.debug(f"Sending TCP Message: '{msg}'")
-
-        # Proactive health check — detect dead socket before the 2 s ack timeout
-        if not self._check_socket_health():
-            log.warning("[eth2can] _tcp_send: socket unhealthy before send, triggering reconnect")
-            self._mark_fault_detected()
-            self._log_uotek_device_failure("socket_unhealthy", "dead socket detected by proactive health check before send")
-            self._generate_failure_diagnostic("Socket unhealthy before send")
-            self.__last_failure_type = "socket_unhealthy"
-            if self._reconnect():
-                log.warning("[eth2can] Reconnected successfully (proactive). Retrying send on fresh socket.")
-                # Safe to retry: we haven't sent anything yet on this call
-                self.__socket.sendall(msg)
-                return
-            raise ConnectionResetError("[eth2can] Socket dead and reconnection failed before send")
+        if not self._proxy_mode:
+            if not self._check_socket_health():
+                log.warning("[eth2can] _socket_send: socket unhealthy before send, triggering reconnect")
+                self._mark_fault_detected()
+                self._log_uotek_device_failure(
+                    "socket_unhealthy",
+                    "dead socket detected by proactive health check before send",
+                )
+                self._generate_failure_diagnostic("Socket unhealthy before send")
+                self.__last_failure_type = "socket_unhealthy"
+                if self._reconnect():
+                    log.warning(
+                        "[eth2can] Reconnected successfully (proactive). Retrying send on fresh socket."
+                    )
+                    self.__socket.sendall(msg)
+                    return
+                raise ConnectionResetError("[eth2can] Socket dead and reconnection failed before send")
 
         try:
             self.__socket.sendall(msg)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError) as e:
             log.error(f"[eth2can] Send failed with connection error: {e}")
-            self._mark_fault_detected()
             error_type = type(e).__name__
+            if self._proxy_mode:
+                if retry_on_error:
+                    self._generate_failure_diagnostic(f"Send failed: {error_type}")
+                    if self._reconnect():
+                        log.warning(
+                            "[eth2can] Reconnected successfully after send error. "
+                            "NOT retrying send to avoid duplicate messages - let higher layer retry."
+                        )
+                raise
+            self._mark_fault_detected()
             self._log_uotek_device_failure(error_type, f"TCP error on send: {e}")
             if retry_on_error:
-                # Generate diagnostic at time of error (before reconnect attempt)
                 self._generate_failure_diagnostic(f"Send failed: {error_type}")
                 self.__last_failure_type = error_type
-                # Attempt reconnection to restore connection for future sends
-                # but do NOT retry this specific send - it may have already gone through
-                # and retrying would cause duplicate messages (stale message repush)
                 if self._reconnect():
-                    log.warning("[eth2can] Reconnected successfully after send error. "
-                               "NOT retrying send to avoid duplicate messages - let higher layer retry.")
-                    # Re-raise the exception so higher layer can decide whether to retry
-                    # with proper counter management
+                    log.warning(
+                        "[eth2can] Reconnected successfully after send error. "
+                        "NOT retrying send to avoid duplicate messages - let higher layer retry."
+                    )
             raise
 
     def send(self, msg, timeout=None):
@@ -561,11 +754,20 @@ class MorphleCanBus(can.BusABC):
         """
         log.debug("canMessage arbitration_id={} data={} dlc={} timestamp={}".format(msg.arbitration_id,
                                                                                    msg.data, msg.dlc, msg.timestamp))
+        if self._proxy_mode:
+            payload = self._proxy_protocol.encode_send(
+                self._proxy_bus_id,
+                msg.arbitration_id,
+                bytes(msg.data)[:8],
+            )
+            self._socket_send(payload)
+            return
+
         header_payload = struct.pack(self.__COMMAND_STRUCT_HEADER, self.__ethcan_message_head, msg.arbitration_id)
         homing_payload = header_payload + msg.data
 
         log.debug("payload to be sent=" + str([hex(a) for a in homing_payload]))
-        self._tcp_send(homing_payload)
+        self._socket_send(homing_payload)
 
     def shutdown(self):
         """Stops all active periodic tasks and closes the socket."""
