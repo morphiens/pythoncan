@@ -7,9 +7,12 @@ https://www.uotek.com/Uploads/file/20230210/20230210143551_12219.pdf
 import datetime
 import errno
 import logging
+import os
 import select
+import shutil
 import socket
 import struct
+import subprocess
 import time
 import traceback
 import threading
@@ -26,6 +29,118 @@ except ImportError:
     log_diagnostic_report = None
 
 log = logging.getLogger("can_comm_logger")
+
+_CAN_SERVICE_STATE_LOCK = threading.Lock()
+_STOPPED_PROXY_FOR_DIRECT_MODE = False
+
+
+def _eth2can_repo_root() -> str:
+    """Repo root (parent of ``canserver``) from this file path."""
+    d = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(5):
+        d = os.path.dirname(d)
+    return d
+
+
+def _has_systemd() -> bool:
+    return os.path.isdir("/run/systemd/system") and shutil.which("systemctl") is not None
+
+
+def _eth2can_proxy_unit_active() -> bool:
+    if not _has_systemd():
+        return False
+    try:
+        r = subprocess.run(
+            ["systemctl", "is-active", "--quiet", "eth2can-proxy.service"],
+            timeout=5,
+            capture_output=True,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _sudo_noninteractive(cmd: list, timeout: float = 180) -> bool:
+    try:
+        r = subprocess.run(cmd, timeout=timeout, capture_output=True, text=True)
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or "").strip()
+            if err:
+                log.debug("[eth2can] command failed (%s): %s", cmd, err[:500])
+        return r.returncode == 0
+    except Exception as e:
+        log.warning("[eth2can] command error %s: %s", cmd, e)
+        return False
+
+
+def _setup_can_service_script_path() -> str:
+    return os.path.join(_eth2can_repo_root(), "canserver", "eth2can_proxy", "setup_can_service.sh")
+
+
+def _stop_eth2can_proxy_for_direct_mode() -> None:
+    """Release UOTEK TCP ports when using direct morphle_eth2can (no local proxy)."""
+    global _STOPPED_PROXY_FOR_DIRECT_MODE
+    if not _has_systemd():
+        return
+    with _CAN_SERVICE_STATE_LOCK:
+        if _STOPPED_PROXY_FOR_DIRECT_MODE:
+            return
+        if not _eth2can_proxy_unit_active():
+            _STOPPED_PROXY_FOR_DIRECT_MODE = True
+            return
+        ok = _sudo_noninteractive(
+            ["sudo", "-n", "systemctl", "stop", "eth2can-proxy.service"],
+            timeout=60,
+        )
+        _STOPPED_PROXY_FOR_DIRECT_MODE = True
+        if ok:
+            log.info("[eth2can] Stopped eth2can-proxy.service (direct UOTEK; should_use_can_service is false)")
+        else:
+            log.warning(
+                "[eth2can] Could not stop eth2can-proxy.service (direct mode). "
+                "Stop manually if UOTEK connect fails: sudo systemctl stop eth2can-proxy.service"
+            )
+
+
+def _ensure_eth2can_proxy_for_mux_mode() -> None:
+    """Ensure systemd proxy is up when using unified mux; run setup script if start fails."""
+    if not _has_systemd():
+        return
+    with _CAN_SERVICE_STATE_LOCK:
+        if _eth2can_proxy_unit_active():
+            return
+        if _sudo_noninteractive(
+            ["sudo", "-n", "systemctl", "start", "eth2can-proxy.service"],
+            timeout=60,
+        ) and _eth2can_proxy_unit_active():
+            log.info("[eth2can] Started eth2can-proxy.service")
+            return
+        script = _setup_can_service_script_path()
+        if not os.path.isfile(script):
+            log.warning("[eth2can] eth2can-proxy not active; setup script not found: %s", script)
+            return
+        log.info("[eth2can] Running setup_can_service.sh (passwordless sudo from setup_repo) ...")
+        if _sudo_noninteractive(["sudo", "-n", "bash", script], timeout=180):
+            if _eth2can_proxy_unit_active():
+                log.info("[eth2can] eth2can-proxy.service active after setup")
+            else:
+                log.warning("[eth2can] setup finished but eth2can-proxy.service is still inactive")
+        else:
+            log.warning(
+                "[eth2can] Could not install/start eth2can-proxy (need passwordless sudo). "
+                "Run: bash %s",
+                script,
+            )
+
+
+def should_use_separate_can_service():
+    """Return ``DeviceConfig.should_use_can_service`` when master config is loadable; otherwise ``False``."""
+    try:
+        from src.master.dao.Config import Config
+        return Config.get_agent().device_config.should_use_can_service
+    except Exception:
+        return False
+
 
 # TCP Keepalive configuration
 TCP_KEEPALIVE_IDLE = 30      # Start keepalive probes after 30s idle
@@ -56,16 +171,26 @@ def connect_to_server(s, host, port):
     timeout_ms = 10000
     now = time.time() * 1000
     end_time = now + timeout_ms
+    last_err = None
     while now < end_time:
         try:
             s.connect((host, port))
             configure_tcp_keepalive(s)
             return
         except Exception as e:
-            log.warning(f"Failed to bind to server: {type(e)} Message: {e}")
+            last_err = e
+            time.sleep(0.05)
             now = time.time() * 1000
+    log.warning(
+        "[eth2can] connect_to_server: failed after %d ms to %s:%s last_error=%s %s",
+        timeout_ms,
+        host,
+        port,
+        type(last_err).__name__ if last_err else "unknown",
+        last_err,
+    )
     raise TimeoutError(
-        f"connect_to_server: Failed to connect server for {timeout_ms} ms"
+        f"connect_to_server: Failed to connect server for {timeout_ms} ms: {last_err!r}"
     )
 
 
@@ -101,9 +226,38 @@ class MorphleCanBus(can.BusABC):
         self.__ethcan_message_fixed_len = 13
         self.__ethcan_message_head = 0x08
 
-        self.__host = host
-        self.__port = port
-        
+        self.__via_proxy = should_use_separate_can_service()
+        self.__uoteck_host = host
+        self.__uoteck_port = int(port)
+        self.__mux_handle = None
+        self.__mux_bus_id = None
+
+        if self.__via_proxy:
+            _ensure_eth2can_proxy_for_mux_mode()
+        else:
+            _stop_eth2can_proxy_for_direct_mode()
+
+        if self.__via_proxy:
+            from canserver.eth2can_proxy.env import resolve_proxy_endpoint
+            from canserver.eth2can_proxy.protocol import bus_id_from_uoteck_port
+            from canserver.eth2can_proxy.shared_client import attach_proxy_mux
+
+            self.__host, self.__port = resolve_proxy_endpoint()
+            self.__mux_bus_id = bus_id_from_uoteck_port(self.__uoteck_port)
+            self.__mux_handle = attach_proxy_mux(self.__host, self.__port, self.__uoteck_port)
+            self.channel_info = (
+                f"morphle_eth2can proxy(mux) {self.__host}:{self.__port} "
+                f"-> uoteck {self.__uoteck_host}:{self.__uoteck_port} bus_id={self.__mux_bus_id}"
+            )
+            self.__socket = None
+            log.info(
+                f"morphle_eth2can: shared proxy mux at {self.__host}:{self.__port} "
+                f"bus_id={self.__mux_bus_id}"
+            )
+        else:
+            self.__host, self.__port = host, int(port)
+            self.channel_info = f"morphle_eth2can connecting on {host}:{port}"
+
         # Reconnection state
         self.__reconnect_lock = threading.Lock()
         self.__is_reconnecting = False
@@ -111,15 +265,14 @@ class MorphleCanBus(can.BusABC):
         self.__last_failure_type = "unknown"  # set before each _reconnect() call
         self.__fault_detected_at: float = 0.0  # monotonic timestamp of first fault detection
 
-        self.__socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.__message_buffer = deque()
         self.__receive_buffer = []
-        self.channel_info = f"morphle_eth2can connecting on {host}:{port}"
-        connect_to_server(self.__socket, self.__host, self.__port)
-
-        log.info(
-            f"morphle_eth2can: started socket server at address {self.__socket.getsockname()}"
-        )
+        if not self.__via_proxy:
+            self.__socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            connect_to_server(self.__socket, self.__host, self.__port)
+            log.info(
+                f"morphle_eth2can: started socket server at address {self.__socket.getsockname()}"
+            )
 
         super().__init__(channel=None, can_filters=can_filters, **kwargs)
     
@@ -134,6 +287,21 @@ class MorphleCanBus(can.BusABC):
         Returns True if reconnection was successful, False otherwise.
         Thread-safe: only one reconnection attempt at a time.
         """
+        if self.__mux_handle is not None:
+            with self.__reconnect_lock:
+                if self.__is_reconnecting:
+                    log.debug("[eth2can] Reconnection already in progress, waiting...")
+                    return self.__connection_healthy
+                self.__is_reconnecting = True
+            try:
+                log.warning(f"[eth2can] 🔄 Attempting mux reconnect to {self.__host}:{self.__port}...")
+                ok = self.__mux_handle.reconnect()
+                self.__connection_healthy = ok
+                return ok
+            finally:
+                with self.__reconnect_lock:
+                    self.__is_reconnecting = False
+
         with self.__reconnect_lock:
             if self.__is_reconnecting:
                 log.debug("[eth2can] Reconnection already in progress, waiting...")
@@ -242,7 +410,7 @@ class MorphleCanBus(can.BusABC):
             nonlocal ping_ok
             try:
                 result = subprocess.run(
-                    ['ping', '-c', '1', '-W', '1', self.__host],
+                    ['ping', '-c', '1', '-W', '1', self.__uoteck_host],
                     capture_output=True, timeout=2
                 )
                 ping_ok = (result.returncode == 0)
@@ -254,7 +422,7 @@ class MorphleCanBus(can.BusABC):
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.settimeout(1.0)
-                s.connect((self.__host, self.__port))
+                s.connect((self.__uoteck_host, self.__uoteck_port))
                 s.close()
                 port_open = True
             except Exception:
@@ -302,20 +470,20 @@ class MorphleCanBus(can.BusABC):
             if ping_ok and not port_open:
                 fault_class = "UOTEK_DEVICE_FAULT"
                 fault_desc = (
-                    f"device is pingable but TCP port {self.__port} is DOWN "
+                    f"device is pingable but TCP port {self.__uoteck_port} is DOWN "
                     f"→ UOTEK firmware reset / watchdog cycle"
                 )
             elif not ping_ok:
                 fault_class = "NETWORK_FAULT"
                 fault_desc = (
-                    f"device {self.__host} is NOT pingable "
+                    f"device {self.__uoteck_host} is NOT pingable "
                     f"→ network switch / cable / PoE issue"
                 )
             else:
                 # ping_ok=True AND port_open=True: device recovered before we even probed
                 fault_class = "UNKNOWN_FAULT"
                 fault_desc = (
-                    f"device is pingable and port {self.__port} is already open "
+                    f"device is pingable and port {self.__uoteck_port} is already open "
                     f"(recovered before probe, or transient glitch)"
                 )
         else:
@@ -329,7 +497,7 @@ class MorphleCanBus(can.BusABC):
 
         log.warning(
             f"[UOTEK_FAULT] ⚠️  CAN bus TCP drop  "
-            f"| device={self.__host}:{self.__port}  "
+            f"| device={self.__uoteck_host}:{self.__uoteck_port}  "
             f"| error={error_type}  "
             f"| fault_class={fault_class}  "
             f"| {fault_desc}  "
@@ -345,9 +513,9 @@ class MorphleCanBus(can.BusABC):
             try:
                 log_diagnostic_report(
                     trigger_reason=f"eth2can: {reason}",
-                    trigger_device=f"eth2can @ {self.__host}:{self.__port}",
+                    trigger_device=f"eth2can @ {self.__uoteck_host}:{self.__uoteck_port}",
                     check_ports=True,
-                    device_ports={self.__host: self.__port},
+                    device_ports={self.__uoteck_host: self.__uoteck_port},
                     logger=log
                 )
             except Exception as e:
@@ -355,18 +523,25 @@ class MorphleCanBus(can.BusABC):
         else:
             # Basic diagnostic without the full module
             log.error(f"[eth2can] 📊 Basic connection diagnostic:")
-            log.error(f"   Target: {self.__host}:{self.__port}")
+            log.error(
+                f"   Target: {self.__host}:{self.__port}"
+                + (
+                    f" (uoteck {self.__uoteck_host}:{self.__uoteck_port})"
+                    if self.__via_proxy
+                    else ""
+                )
+            )
             log.error(f"   Connection healthy: {self.__connection_healthy}")
             log.error(f"   Reconnecting: {self.__is_reconnecting}")
             # Try a simple ping
             try:
                 import subprocess
                 result = subprocess.run(
-                    ['ping', '-c', '1', '-W', '2', self.__host],
+                    ['ping', '-c', '1', '-W', '2', self.__uoteck_host],
                     capture_output=True, text=True, timeout=3
                 )
                 ping_ok = result.returncode == 0
-                log.error(f"   Ping to {self.__host}: {'✓ OK' if ping_ok else '✗ FAILED'}")
+                log.error(f"   Ping to {self.__uoteck_host}: {'✓ OK' if ping_ok else '✗ FAILED'}")
             except Exception as e:
                 log.error(f"   Ping check failed: {e}")
 
@@ -374,6 +549,12 @@ class MorphleCanBus(can.BusABC):
         if len(self.__message_buffer) != 0:
             can_message = self.__message_buffer.popleft()
             return can_message, False
+
+        if self.__mux_handle is not None:
+            msg = self.__mux_handle.recv_message(timeout)
+            if msg is None:
+                return None, False
+            return msg, False
 
         try:
             # get all sockets that are ready (can be a list with a single value
@@ -477,6 +658,8 @@ class MorphleCanBus(can.BusABC):
 
         Returns True if the socket appears healthy, False if it is dead.
         """
+        if self.__mux_handle is not None:
+            return self.__mux_handle.check_socket_health()
         try:
             # Check for exceptional conditions (RST / socket error)
             _, _, exceptional = select.select([], [], [self.__socket], 0)
@@ -517,6 +700,34 @@ class MorphleCanBus(can.BusABC):
         3. The higher-level protocol (node.py) already has retry logic with counters
         """
         log.debug(f"Sending TCP Message: '{msg}'")
+
+        if self.__mux_handle is not None:
+            from canserver.eth2can_proxy.protocol import CLIENT_MUX_LEN
+
+            if not self._check_socket_health():
+                self._mark_fault_detected()
+                if self._reconnect():
+                    if len(msg) == CLIENT_MUX_LEN:
+                        self.__mux_handle.send_raw_14(msg)
+                    else:
+                        self.__mux_handle.send_mux_13(msg)
+                    return
+                raise ConnectionResetError("[eth2can] Mux dead and reconnect failed")
+            try:
+                if len(msg) == CLIENT_MUX_LEN:
+                    self.__mux_handle.send_raw_14(msg)
+                else:
+                    self.__mux_handle.send_mux_13(msg)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError) as e:
+                log.error(f"[eth2can] Mux send failed: {e}")
+                self._mark_fault_detected()
+                self.__last_failure_type = type(e).__name__
+                if self._reconnect():
+                    log.warning(
+                        "[eth2can] mux: reconnected after send error; NOT retrying send — let higher layer retry"
+                    )
+                raise
+            return
 
         # Proactive health check — detect dead socket before the 2 s ack timeout
         if not self._check_socket_health():
@@ -567,7 +778,24 @@ class MorphleCanBus(can.BusABC):
         log.debug("payload to be sent=" + str([hex(a) for a in homing_payload]))
         self._tcp_send(homing_payload)
 
+    def uses_eth2can_proxy(self) -> bool:
+        """True when connected via local eth2can proxy (DeviceConfig.should_use_can_service)."""
+        return self.__via_proxy
+
+    def send_restart_chip(self, uuid_hex: str) -> None:
+        """Restart-chip command via proxy control frame (see canserver.eth2can_proxy.protocol)."""
+        if not self.__via_proxy:
+            raise RuntimeError("send_restart_chip only valid in eth2can proxy client mode")
+        from canserver.eth2can_proxy.protocol import build_restart_chip_control
+
+        self._tcp_send(build_restart_chip_control(uuid_hex, self.__mux_bus_id))
+        time.sleep(2)
+
     def shutdown(self):
         """Stops all active periodic tasks and closes the socket."""
         super().shutdown()
-        self.__socket.close()
+        if self.__mux_handle is not None:
+            self.__mux_handle.detach()
+            self.__mux_handle = None
+        else:
+            self.__socket.close()
