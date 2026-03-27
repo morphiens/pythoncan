@@ -122,7 +122,7 @@ class MorphleCanBus(can.BusABC):
             from canserver.eth2can_proxy.protocol import bus_id_from_uoteck_port
             from canserver.eth2can_proxy.shared_client import attach_proxy_mux
 
-            self.__host, self.__port = resolve_proxy_endpoint(host, self.__uoteck_port)
+            self.__host, self.__port = resolve_proxy_endpoint()
             self.__mux_bus_id = bus_id_from_uoteck_port(self.__uoteck_port)
             self.__mux_handle = attach_proxy_mux(self.__host, self.__port, self.__uoteck_port)
             self.channel_info = (
