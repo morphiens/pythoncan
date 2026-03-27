@@ -7,9 +7,12 @@ https://www.uotek.com/Uploads/file/20230210/20230210143551_12219.pdf
 import datetime
 import errno
 import logging
+import os
 import select
+import shutil
 import socket
 import struct
+import subprocess
 import time
 import traceback
 import threading
@@ -26,6 +29,108 @@ except ImportError:
     log_diagnostic_report = None
 
 log = logging.getLogger("can_comm_logger")
+
+_CAN_SERVICE_STATE_LOCK = threading.Lock()
+_STOPPED_PROXY_FOR_DIRECT_MODE = False
+
+
+def _eth2can_repo_root() -> str:
+    """Repo root (parent of ``canserver``) from this file path."""
+    d = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(5):
+        d = os.path.dirname(d)
+    return d
+
+
+def _has_systemd() -> bool:
+    return os.path.isdir("/run/systemd/system") and shutil.which("systemctl") is not None
+
+
+def _eth2can_proxy_unit_active() -> bool:
+    if not _has_systemd():
+        return False
+    try:
+        r = subprocess.run(
+            ["systemctl", "is-active", "--quiet", "eth2can-proxy.service"],
+            timeout=5,
+            capture_output=True,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _sudo_noninteractive(cmd: list, timeout: float = 180) -> bool:
+    try:
+        r = subprocess.run(cmd, timeout=timeout, capture_output=True, text=True)
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or "").strip()
+            if err:
+                log.debug("[eth2can] command failed (%s): %s", cmd, err[:500])
+        return r.returncode == 0
+    except Exception as e:
+        log.warning("[eth2can] command error %s: %s", cmd, e)
+        return False
+
+
+def _setup_can_service_script_path() -> str:
+    return os.path.join(_eth2can_repo_root(), "canserver", "eth2can_proxy", "setup_can_service.sh")
+
+
+def _stop_eth2can_proxy_for_direct_mode() -> None:
+    """Release UOTEK TCP ports when using direct morphle_eth2can (no local proxy)."""
+    global _STOPPED_PROXY_FOR_DIRECT_MODE
+    if not _has_systemd():
+        return
+    with _CAN_SERVICE_STATE_LOCK:
+        if _STOPPED_PROXY_FOR_DIRECT_MODE:
+            return
+        if not _eth2can_proxy_unit_active():
+            _STOPPED_PROXY_FOR_DIRECT_MODE = True
+            return
+        ok = _sudo_noninteractive(
+            ["sudo", "-n", "systemctl", "stop", "eth2can-proxy.service"],
+            timeout=60,
+        )
+        _STOPPED_PROXY_FOR_DIRECT_MODE = True
+        if ok:
+            log.info("[eth2can] Stopped eth2can-proxy.service (direct UOTEK; should_use_can_service is false)")
+        else:
+            log.warning(
+                "[eth2can] Could not stop eth2can-proxy.service (direct mode). "
+                "Stop manually if UOTEK connect fails: sudo systemctl stop eth2can-proxy.service"
+            )
+
+
+def _ensure_eth2can_proxy_for_mux_mode() -> None:
+    """Ensure systemd proxy is up when using unified mux; run setup script if start fails."""
+    if not _has_systemd():
+        return
+    with _CAN_SERVICE_STATE_LOCK:
+        if _eth2can_proxy_unit_active():
+            return
+        if _sudo_noninteractive(
+            ["sudo", "-n", "systemctl", "start", "eth2can-proxy.service"],
+            timeout=60,
+        ) and _eth2can_proxy_unit_active():
+            log.info("[eth2can] Started eth2can-proxy.service")
+            return
+        script = _setup_can_service_script_path()
+        if not os.path.isfile(script):
+            log.warning("[eth2can] eth2can-proxy not active; setup script not found: %s", script)
+            return
+        log.info("[eth2can] Running setup_can_service.sh (passwordless sudo from setup_repo) ...")
+        if _sudo_noninteractive(["sudo", "-n", "bash", script], timeout=180):
+            if _eth2can_proxy_unit_active():
+                log.info("[eth2can] eth2can-proxy.service active after setup")
+            else:
+                log.warning("[eth2can] setup finished but eth2can-proxy.service is still inactive")
+        else:
+            log.warning(
+                "[eth2can] Could not install/start eth2can-proxy (need passwordless sudo). "
+                "Run: bash %s",
+                script,
+            )
 
 
 def should_use_separate_can_service():
@@ -66,16 +171,26 @@ def connect_to_server(s, host, port):
     timeout_ms = 10000
     now = time.time() * 1000
     end_time = now + timeout_ms
+    last_err = None
     while now < end_time:
         try:
             s.connect((host, port))
             configure_tcp_keepalive(s)
             return
         except Exception as e:
-            log.warning(f"Failed to bind to server: {type(e)} Message: {e}")
+            last_err = e
+            time.sleep(0.05)
             now = time.time() * 1000
+    log.warning(
+        "[eth2can] connect_to_server: failed after %d ms to %s:%s last_error=%s %s",
+        timeout_ms,
+        host,
+        port,
+        type(last_err).__name__ if last_err else "unknown",
+        last_err,
+    )
     raise TimeoutError(
-        f"connect_to_server: Failed to connect server for {timeout_ms} ms"
+        f"connect_to_server: Failed to connect server for {timeout_ms} ms: {last_err!r}"
     )
 
 
@@ -116,6 +231,11 @@ class MorphleCanBus(can.BusABC):
         self.__uoteck_port = int(port)
         self.__mux_handle = None
         self.__mux_bus_id = None
+
+        if self.__via_proxy:
+            _ensure_eth2can_proxy_for_mux_mode()
+        else:
+            _stop_eth2can_proxy_for_direct_mode()
 
         if self.__via_proxy:
             from canserver.eth2can_proxy.env import resolve_proxy_endpoint
