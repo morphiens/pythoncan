@@ -27,6 +27,16 @@ except ImportError:
 
 log = logging.getLogger("can_comm_logger")
 
+
+def should_use_separate_can_service():
+    """Return ``DeviceConfig.should_use_can_service`` when master config is loadable; otherwise ``False``."""
+    try:
+        from src.master.dao.Config import Config
+        return Config.get_agent().device_config.should_use_can_service
+    except Exception:
+        return False
+
+
 # TCP Keepalive configuration
 TCP_KEEPALIVE_IDLE = 30      # Start keepalive probes after 30s idle
 TCP_KEEPALIVE_INTERVAL = 10  # Send keepalive probes every 10s
@@ -101,9 +111,33 @@ class MorphleCanBus(can.BusABC):
         self.__ethcan_message_fixed_len = 13
         self.__ethcan_message_head = 0x08
 
-        self.__host = host
-        self.__port = port
-        
+        self.__via_proxy = should_use_separate_can_service()
+        self.__uoteck_host = host
+        self.__uoteck_port = int(port)
+        self.__mux_handle = None
+        self.__mux_bus_id = None
+
+        if self.__via_proxy:
+            from canserver.eth2can_proxy.env import resolve_proxy_endpoint
+            from canserver.eth2can_proxy.protocol import bus_id_from_uoteck_port
+            from canserver.eth2can_proxy.shared_client import attach_proxy_mux
+
+            self.__host, self.__port = resolve_proxy_endpoint(host, self.__uoteck_port)
+            self.__mux_bus_id = bus_id_from_uoteck_port(self.__uoteck_port)
+            self.__mux_handle = attach_proxy_mux(self.__host, self.__port, self.__uoteck_port)
+            self.channel_info = (
+                f"morphle_eth2can proxy(mux) {self.__host}:{self.__port} "
+                f"-> uoteck {self.__uoteck_host}:{self.__uoteck_port} bus_id={self.__mux_bus_id}"
+            )
+            self.__socket = None
+            log.info(
+                f"morphle_eth2can: shared proxy mux at {self.__host}:{self.__port} "
+                f"bus_id={self.__mux_bus_id}"
+            )
+        else:
+            self.__host, self.__port = host, int(port)
+            self.channel_info = f"morphle_eth2can connecting on {host}:{port}"
+
         # Reconnection state
         self.__reconnect_lock = threading.Lock()
         self.__is_reconnecting = False
@@ -111,15 +145,14 @@ class MorphleCanBus(can.BusABC):
         self.__last_failure_type = "unknown"  # set before each _reconnect() call
         self.__fault_detected_at: float = 0.0  # monotonic timestamp of first fault detection
 
-        self.__socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.__message_buffer = deque()
         self.__receive_buffer = []
-        self.channel_info = f"morphle_eth2can connecting on {host}:{port}"
-        connect_to_server(self.__socket, self.__host, self.__port)
-
-        log.info(
-            f"morphle_eth2can: started socket server at address {self.__socket.getsockname()}"
-        )
+        if not self.__via_proxy:
+            self.__socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            connect_to_server(self.__socket, self.__host, self.__port)
+            log.info(
+                f"morphle_eth2can: started socket server at address {self.__socket.getsockname()}"
+            )
 
         super().__init__(channel=None, can_filters=can_filters, **kwargs)
     
@@ -134,6 +167,21 @@ class MorphleCanBus(can.BusABC):
         Returns True if reconnection was successful, False otherwise.
         Thread-safe: only one reconnection attempt at a time.
         """
+        if self.__mux_handle is not None:
+            with self.__reconnect_lock:
+                if self.__is_reconnecting:
+                    log.debug("[eth2can] Reconnection already in progress, waiting...")
+                    return self.__connection_healthy
+                self.__is_reconnecting = True
+            try:
+                log.warning(f"[eth2can] 🔄 Attempting mux reconnect to {self.__host}:{self.__port}...")
+                ok = self.__mux_handle.reconnect()
+                self.__connection_healthy = ok
+                return ok
+            finally:
+                with self.__reconnect_lock:
+                    self.__is_reconnecting = False
+
         with self.__reconnect_lock:
             if self.__is_reconnecting:
                 log.debug("[eth2can] Reconnection already in progress, waiting...")
@@ -242,7 +290,7 @@ class MorphleCanBus(can.BusABC):
             nonlocal ping_ok
             try:
                 result = subprocess.run(
-                    ['ping', '-c', '1', '-W', '1', self.__host],
+                    ['ping', '-c', '1', '-W', '1', self.__uoteck_host],
                     capture_output=True, timeout=2
                 )
                 ping_ok = (result.returncode == 0)
@@ -254,7 +302,7 @@ class MorphleCanBus(can.BusABC):
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.settimeout(1.0)
-                s.connect((self.__host, self.__port))
+                s.connect((self.__uoteck_host, self.__uoteck_port))
                 s.close()
                 port_open = True
             except Exception:
@@ -302,20 +350,20 @@ class MorphleCanBus(can.BusABC):
             if ping_ok and not port_open:
                 fault_class = "UOTEK_DEVICE_FAULT"
                 fault_desc = (
-                    f"device is pingable but TCP port {self.__port} is DOWN "
+                    f"device is pingable but TCP port {self.__uoteck_port} is DOWN "
                     f"→ UOTEK firmware reset / watchdog cycle"
                 )
             elif not ping_ok:
                 fault_class = "NETWORK_FAULT"
                 fault_desc = (
-                    f"device {self.__host} is NOT pingable "
+                    f"device {self.__uoteck_host} is NOT pingable "
                     f"→ network switch / cable / PoE issue"
                 )
             else:
                 # ping_ok=True AND port_open=True: device recovered before we even probed
                 fault_class = "UNKNOWN_FAULT"
                 fault_desc = (
-                    f"device is pingable and port {self.__port} is already open "
+                    f"device is pingable and port {self.__uoteck_port} is already open "
                     f"(recovered before probe, or transient glitch)"
                 )
         else:
@@ -329,7 +377,7 @@ class MorphleCanBus(can.BusABC):
 
         log.warning(
             f"[UOTEK_FAULT] ⚠️  CAN bus TCP drop  "
-            f"| device={self.__host}:{self.__port}  "
+            f"| device={self.__uoteck_host}:{self.__uoteck_port}  "
             f"| error={error_type}  "
             f"| fault_class={fault_class}  "
             f"| {fault_desc}  "
@@ -345,9 +393,9 @@ class MorphleCanBus(can.BusABC):
             try:
                 log_diagnostic_report(
                     trigger_reason=f"eth2can: {reason}",
-                    trigger_device=f"eth2can @ {self.__host}:{self.__port}",
+                    trigger_device=f"eth2can @ {self.__uoteck_host}:{self.__uoteck_port}",
                     check_ports=True,
-                    device_ports={self.__host: self.__port},
+                    device_ports={self.__uoteck_host: self.__uoteck_port},
                     logger=log
                 )
             except Exception as e:
@@ -355,18 +403,25 @@ class MorphleCanBus(can.BusABC):
         else:
             # Basic diagnostic without the full module
             log.error(f"[eth2can] 📊 Basic connection diagnostic:")
-            log.error(f"   Target: {self.__host}:{self.__port}")
+            log.error(
+                f"   Target: {self.__host}:{self.__port}"
+                + (
+                    f" (uoteck {self.__uoteck_host}:{self.__uoteck_port})"
+                    if self.__via_proxy
+                    else ""
+                )
+            )
             log.error(f"   Connection healthy: {self.__connection_healthy}")
             log.error(f"   Reconnecting: {self.__is_reconnecting}")
             # Try a simple ping
             try:
                 import subprocess
                 result = subprocess.run(
-                    ['ping', '-c', '1', '-W', '2', self.__host],
+                    ['ping', '-c', '1', '-W', '2', self.__uoteck_host],
                     capture_output=True, text=True, timeout=3
                 )
                 ping_ok = result.returncode == 0
-                log.error(f"   Ping to {self.__host}: {'✓ OK' if ping_ok else '✗ FAILED'}")
+                log.error(f"   Ping to {self.__uoteck_host}: {'✓ OK' if ping_ok else '✗ FAILED'}")
             except Exception as e:
                 log.error(f"   Ping check failed: {e}")
 
@@ -374,6 +429,12 @@ class MorphleCanBus(can.BusABC):
         if len(self.__message_buffer) != 0:
             can_message = self.__message_buffer.popleft()
             return can_message, False
+
+        if self.__mux_handle is not None:
+            msg = self.__mux_handle.recv_message(timeout)
+            if msg is None:
+                return None, False
+            return msg, False
 
         try:
             # get all sockets that are ready (can be a list with a single value
@@ -477,6 +538,8 @@ class MorphleCanBus(can.BusABC):
 
         Returns True if the socket appears healthy, False if it is dead.
         """
+        if self.__mux_handle is not None:
+            return self.__mux_handle.check_socket_health()
         try:
             # Check for exceptional conditions (RST / socket error)
             _, _, exceptional = select.select([], [], [self.__socket], 0)
@@ -517,6 +580,34 @@ class MorphleCanBus(can.BusABC):
         3. The higher-level protocol (node.py) already has retry logic with counters
         """
         log.debug(f"Sending TCP Message: '{msg}'")
+
+        if self.__mux_handle is not None:
+            from canserver.eth2can_proxy.protocol import CLIENT_MUX_LEN
+
+            if not self._check_socket_health():
+                self._mark_fault_detected()
+                if self._reconnect():
+                    if len(msg) == CLIENT_MUX_LEN:
+                        self.__mux_handle.send_raw_14(msg)
+                    else:
+                        self.__mux_handle.send_mux_13(msg)
+                    return
+                raise ConnectionResetError("[eth2can] Mux dead and reconnect failed")
+            try:
+                if len(msg) == CLIENT_MUX_LEN:
+                    self.__mux_handle.send_raw_14(msg)
+                else:
+                    self.__mux_handle.send_mux_13(msg)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError) as e:
+                log.error(f"[eth2can] Mux send failed: {e}")
+                self._mark_fault_detected()
+                self.__last_failure_type = type(e).__name__
+                if self._reconnect():
+                    log.warning(
+                        "[eth2can] mux: reconnected after send error; NOT retrying send — let higher layer retry"
+                    )
+                raise
+            return
 
         # Proactive health check — detect dead socket before the 2 s ack timeout
         if not self._check_socket_health():
@@ -567,7 +658,24 @@ class MorphleCanBus(can.BusABC):
         log.debug("payload to be sent=" + str([hex(a) for a in homing_payload]))
         self._tcp_send(homing_payload)
 
+    def uses_eth2can_proxy(self) -> bool:
+        """True when connected via local eth2can proxy (DeviceConfig.should_use_can_service)."""
+        return self.__via_proxy
+
+    def send_restart_chip(self, uuid_hex: str) -> None:
+        """Restart-chip command via proxy control frame (see canserver.eth2can_proxy.protocol)."""
+        if not self.__via_proxy:
+            raise RuntimeError("send_restart_chip only valid in eth2can proxy client mode")
+        from canserver.eth2can_proxy.protocol import build_restart_chip_control
+
+        self._tcp_send(build_restart_chip_control(uuid_hex, self.__mux_bus_id))
+        time.sleep(2)
+
     def shutdown(self):
         """Stops all active periodic tasks and closes the socket."""
         super().shutdown()
-        self.__socket.close()
+        if self.__mux_handle is not None:
+            self.__mux_handle.detach()
+            self.__mux_handle = None
+        else:
+            self.__socket.close()
